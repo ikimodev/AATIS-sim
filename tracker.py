@@ -34,16 +34,24 @@ import math
 import time
 import os
 from collections import deque
-
+from ultralytics import YOLO
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════════
+SIMULATION_MODE = True
+FRAME_W = 800
+FRAME_H = 600
+
 MIN_CONTOUR_AREA = 900          # Ignore contours smaller than this (px²)
 HISTORY_LENGTH   = 80           # Number of past positions to remember
 PREDICTION_DT    = 12           # How many frames ahead to predict
 SMOOTHING_ALPHA  = 0.4          # Exponential smoothing factor (0 = full smooth, 1 = raw)
 ENABLE_SMOOTHING = True         # Start with smoothing enabled
+
+FRAMES_TO_TRACK  = 5            # Number of frames before considered TRACKED
+FRAMES_TO_LOSE   = 15           # Number of frames without detection before considered LOST
+YOLO_MODEL_PATH  = "yolov8n.pt" # Path to YOLO model
 
 # Colors (BGR)
 CLR_DETECTED     = (0, 255, 100)    # Green  — detected position
@@ -57,6 +65,54 @@ CLR_TEXT          = (210, 210, 210)  # Light  — info text
 CLR_HEADER        = (0, 245, 255)   # Gold   — header text
 CLR_ACCENT       = (0, 200, 255)    # Amber  — accent / highlights
 CLR_FUTURE_RING  = (0, 0, 255)     # Red    — final predicted position ring
+
+CLR_STATE_DET    = (0, 200, 255)   # Yellowish
+CLR_STATE_TRK    = (0, 255, 100)   # Green
+CLR_STATE_LST    = (100, 100, 100) # Gray
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SIMULATED TARGET
+# ═══════════════════════════════════════════════════════════════════════════════
+class SimTarget:
+    def __init__(self):
+        self.r = 15
+        self.x = 50.0
+        self.y = FRAME_H / 2.0
+        self.vx = 8.0
+        self.vy = 5.0
+
+    def update(self):
+        self.x += self.vx
+        self.y += self.vy
+        
+        # Add random variations
+        if np.random.random() < 0.05:
+            self.vx += np.random.uniform(-1, 1)
+            self.vy += np.random.uniform(-1, 1)
+            
+        speed = math.hypot(self.vx, self.vy)
+        if speed > 12:
+            self.vx = (self.vx / speed) * 12
+            self.vy = (self.vy / speed) * 12
+            
+        # Bounce off walls
+        if self.x - self.r < 0 or self.x + self.r > FRAME_W:
+            self.vx *= -1
+            self.x = np.clip(self.x, self.r, FRAME_W - self.r)
+        if self.y - self.r < 0 or self.y + self.r > FRAME_H:
+            self.vy *= -1
+            self.y = np.clip(self.y, self.r, FRAME_H - self.r)
+
+    def draw(self, frame):
+        cv2.circle(frame, (int(self.x), int(self.y)), self.r, (255, 255, 255), -1)
+
+def create_bg():
+    bg = np.zeros((FRAME_H, FRAME_W, 3), dtype=np.uint8)
+    for y in range(FRAME_H):
+        v = int(25 + 15 * (y / FRAME_H))
+        bg[y, :] = (v, v+2, v+4)
+    return bg
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -123,49 +179,103 @@ class Detector:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  STAGE 2: TRACKING
+#  STAGE 2: TRACKING & IDENTIFICATION
 # ═══════════════════════════════════════════════════════════════════════════════
 class Tracker:
     """
-    Stores the object's position over time (previous frames).
-    Continuously updates the current position.
+    Tracking & Identification Layer
+    Stores the object's position over time, maintains identity, state, and classification.
     """
 
     def __init__(self, max_history=HISTORY_LENGTH):
-        self.history = deque(maxlen=max_history)   # list of (x, y) positions
-        self.timestamps = deque(maxlen=max_history) # frame numbers
+        self.max_history = max_history
+        self.object_id = 1
+        self.reset()
 
     def reset(self):
-        self.history.clear()
-        self.timestamps.clear()
+        self.history = deque(maxlen=self.max_history)
+        self.timestamps = deque(maxlen=self.max_history)
+        self.bbox_history = deque(maxlen=self.max_history)
+        self.velocity_history = deque(maxlen=self.max_history)
+        self.state = "DETECTED"
+        self.frames_since_seen = 0
+        self.frames_seen = 0
+        self.classification = "Unknown"
+        self.yolo_class = None
 
-    def update(self, position, frame_num):
-        """
-        Add a new detected position to the history.
+    def update(self, position, bbox, frame_num, velocity=None, yolo_class=None):
+        if position is not None:
+            if self.state == "LOST" and self.frames_since_seen > FRAMES_TO_LOSE:
+                old_id = self.object_id
+                self.reset()
+                self.object_id = old_id + 1
+                
+            self.history.append(position)
+            self.timestamps.append(frame_num)
+            if bbox is not None:
+                self.bbox_history.append(bbox)
+            if velocity is not None:
+                self.velocity_history.append(velocity)
+            if yolo_class is not None:
+                self.yolo_class = yolo_class
 
-        position : (x, y) — center of detected object
-        frame_num: current frame index
-        """
-        self.history.append(position)
-        self.timestamps.append(frame_num)
+            self.frames_since_seen = 0
+            self.frames_seen += 1
+
+            if self.frames_seen < FRAMES_TO_TRACK:
+                self.state = "DETECTED"
+            else:
+                self.state = "TRACKED"
+                
+            self._update_classification()
+        else:
+            if self.frames_seen > 0:
+                self.frames_since_seen += 1
+                self.state = "LOST"
+
+    def _update_classification(self):
+        if self.state == "DETECTED" or len(self.velocity_history) < 5:
+            self.classification = "Unknown"
+            if self.yolo_class == "bird":
+                self.classification = "Bird"
+            return
+            
+        speeds = [math.hypot(vx, vy) for vx, vy in self.velocity_history]
+        mean_speed = float(np.mean(speeds))
+        std_speed = float(np.std(speeds))
+        
+        areas = [w*h for _, _, w, h in self.bbox_history]
+        mean_area = float(np.mean(areas))
+        std_area = float(np.std(areas))
+        
+        cv_speed = std_speed / (mean_speed + 1e-5)
+        cv_area = std_area / (mean_area + 1e-5)
+        
+        if self.yolo_class == "bird":
+            self.classification = "Bird"
+        elif self.yolo_class == "airplane" or self.yolo_class == "drone":
+            self.classification = "Drone"
+        else:
+            if cv_area < 0.15 and cv_speed < 0.3 and mean_speed > 2.0:
+                self.classification = "Drone"
+            elif cv_area > 0.2 or cv_speed > 0.4:
+                self.classification = "Bird"
+            else:
+                self.classification = "Unknown"
 
     @property
     def current(self):
-        """Most recent position or None."""
         return self.history[-1] if self.history else None
 
     @property
     def previous(self):
-        """Second-most-recent position or None."""
         return self.history[-2] if len(self.history) >= 2 else None
 
     @property
     def has_enough_data(self):
-        """Need at least 2 points to compute velocity."""
         return len(self.history) >= 2
 
     def get_trail(self):
-        """Return the full position history as a list."""
         return list(self.history)
 
 
@@ -176,17 +286,6 @@ class Predictor:
     """
     Estimates velocity from consecutive positions and predicts the future
     position of the moving object.
-
-    Velocity:
-        vx = x(t) - x(t-1)
-        vy = y(t) - y(t-1)
-
-    Prediction:
-        x_pred = x + vx * dt
-        y_pred = y + vy * dt
-
-    Optional exponential smoothing for stability:
-        vx_smooth = alpha * vx_raw + (1 - alpha) * vx_smooth_prev
     """
 
     def __init__(self, smoothing_alpha=SMOOTHING_ALPHA):
@@ -202,15 +301,11 @@ class Predictor:
     def compute_velocity(self, current, previous):
         """
         Compute raw velocity from two consecutive positions.
-
-        vx = x(t) - x(t-1)
-        vy = y(t) - y(t-1)
         """
         vx_raw = current[0] - previous[0]
         vy_raw = current[1] - previous[1]
 
         if self.smoothing_enabled:
-            # Exponential moving average for stability
             self.vx_smooth = self.alpha * vx_raw + (1 - self.alpha) * self.vx_smooth
             self.vy_smooth = self.alpha * vy_raw + (1 - self.alpha) * self.vy_smooth
             return self.vx_smooth, self.vy_smooth
@@ -218,20 +313,11 @@ class Predictor:
             return float(vx_raw), float(vy_raw)
 
     def predict(self, current, vx, vy, dt):
-        """
-        Predict future position:
-            x_pred = x + vx * dt
-            y_pred = y + vy * dt
-        """
         x_pred = current[0] + vx * dt
         y_pred = current[1] + vy * dt
         return int(round(x_pred)), int(round(y_pred))
 
     def predict_path(self, current, vx, vy, dt, steps=10):
-        """
-        Generate a list of predicted positions from t+1 to t+dt,
-        sampled at `steps` intervals — used to draw the prediction line.
-        """
         path = []
         for i in range(1, steps + 1):
             t = dt * (i / steps)
@@ -245,17 +331,14 @@ class Predictor:
 #  DRAWING UTILITIES
 # ═══════════════════════════════════════════════════════════════════════════════
 def draw_trail(frame, trail, color=CLR_TRAIL, max_thickness=3):
-    """Draw the position history as a fading polyline."""
     n = len(trail)
     for i in range(1, n):
-        alpha = i / n  # 0 = oldest, 1 = newest
+        alpha = i / n
         thickness = max(1, int(alpha * max_thickness))
         c = tuple(int(v * alpha) for v in color)
         cv2.line(frame, trail[i - 1], trail[i], c, thickness, cv2.LINE_AA)
 
-
 def draw_prediction_line(frame, path, color=CLR_PRED_LINE):
-    """Draw the predicted future path as a dashed line with dots."""
     for i, pt in enumerate(path):
         fade = 1.0 - (i / len(path)) * 0.5
         c = tuple(int(v * fade) for v in color)
@@ -264,28 +347,21 @@ def draw_prediction_line(frame, path, color=CLR_PRED_LINE):
         if i > 0 and i % 2 == 0:
             cv2.line(frame, path[i - 1], pt, c, 2, cv2.LINE_AA)
 
-
 def draw_crosshair(frame, center, size=20, color=CLR_PREDICTED, thickness=2):
-    """Draw a targeting crosshair at predicted position."""
     cx, cy = center
     cv2.line(frame, (cx - size, cy), (cx + size, cy), color, thickness, cv2.LINE_AA)
     cv2.line(frame, (cx, cy - size), (cx, cy + size), color, thickness, cv2.LINE_AA)
     cv2.circle(frame, center, size // 2, color, 1, cv2.LINE_AA)
 
-
 def draw_velocity_arrow(frame, origin, vx, vy, scale=5.0, color=CLR_VELOCITY):
-    """Draw an arrow showing the velocity vector direction."""
     end = (int(origin[0] + vx * scale), int(origin[1] + vy * scale))
     cv2.arrowedLine(frame, origin, end, color, 2, cv2.LINE_AA, tipLength=0.3)
 
-
 def draw_info_panel(frame, lines, origin=(10, 10), line_h=26, font_scale=0.50, pad=10):
-    """Draw a semi-transparent info panel with text."""
     h = len(lines) * line_h + pad * 2
     w = max(len(l) for l in lines) * 11 + pad * 2
     x0, y0 = origin
 
-    # Semi-transparent background
     overlay = frame.copy()
     cv2.rectangle(overlay, (x0, y0), (x0 + w, y0 + h), CLR_PANEL_BG, -1)
     cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
@@ -302,25 +378,24 @@ def draw_info_panel(frame, lines, origin=(10, 10), line_h=26, font_scale=0.50, p
 #  MAIN APPLICATION
 # ═══════════════════════════════════════════════════════════════════════════════
 def main():
-    # ── Video source (0 = default webcam, or pass a video file path) ──
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("[ERROR] Cannot open video source. Check your camera.")
-        return
-
-    frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"[INFO] Camera opened: {frame_w}x{frame_h}")
+    frame_w = FRAME_W
+    frame_h = FRAME_H
+    print(f"[INFO] Running in SIMULATION MODE: {frame_w}x{frame_h}")
     print("[INFO] Controls:")
     print("         q = quit | r = reset | s = screenshot")
+    
+    target = SimTarget()
+    bg = create_bg()
     print("         +/- = prediction horizon | f = toggle smoothing")
 
-    # ── Initialize the three stages ───────────────────────────────────────
-    detector  = Detector()       # Stage 1
-    tracker   = Tracker()        # Stage 2
-    predictor = Predictor()      # Stage 3
+    detector  = Detector()       
+    tracker   = Tracker()        
+    predictor = Predictor()      
+    
+    print("[INFO] Loading YOLO model...")
+    yolo_model = YOLO(YOLO_MODEL_PATH)
+    print("[INFO] YOLO loaded.")
 
-    # ── Runtime state ─────────────────────────────────────────────────────
     prediction_dt = PREDICTION_DT
     frame_count = 0
     fps_avg = 0.0
@@ -329,89 +404,107 @@ def main():
     while True:
         t0 = time.perf_counter()
 
-        ret, frame = cap.read()
-        if not ret:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # loop video files
-            continue
+        # Simulate Frame
+        target.update()
+        frame = bg.copy()
+        target.draw(frame)
 
         frame_count += 1
         display = frame.copy()
 
         # ══════════════════════════════════════════════════════════════════
-        #  STAGE 1 — DETECTION
+        #  STAGE 1 — DETECTION & YOLO
         # ══════════════════════════════════════════════════════════════════
         center, bbox, fg_mask = detector.detect(frame)
+        
+        yolo_class = None
+        if center is not None and bbox is not None:
+            # Run YOLO on the bounding box to classify
+            x, y, w, h = bbox
+            pad = 20
+            x1, y1 = max(0, x-pad), max(0, y-pad)
+            x2, y2 = min(frame_w, x+w+pad), min(frame_h, y+h+pad)
+            crop = frame[y1:y2, x1:x2]
+            if crop.size > 0:
+                results = yolo_model(crop, verbose=False)
+                if len(results) > 0 and len(results[0].boxes) > 0:
+                    cls_id = int(results[0].boxes[0].cls[0])
+                    yolo_class = yolo_model.names[cls_id]
 
         # ══════════════════════════════════════════════════════════════════
-        #  STAGE 2 — TRACKING
-        # ══════════════════════════════════════════════════════════════════
-        if center is not None:
-            tracker.update(center, frame_count)
-
-        # ══════════════════════════════════════════════════════════════════
-        #  STAGE 3 — PREDICTION
+        #  STAGE 2 & 3 — PREDICTION & TRACKING
         # ══════════════════════════════════════════════════════════════════
         predicted = None
         pred_path = []
         vx, vy = 0.0, 0.0
         speed = 0.0
 
-        if tracker.has_enough_data:
-            cur = tracker.current
-            prev = tracker.previous
-
-            # Velocity: vx = x(t) - x(t-1), vy = y(t) - y(t-1)
-            vx, vy = predictor.compute_velocity(cur, prev)
-
-            # Prediction: x_pred = x + vx*dt, y_pred = y + vy*dt
-            predicted = predictor.predict(cur, vx, vy, prediction_dt)
-
-            # Path for visualization (intermediate points)
-            pred_path = predictor.predict_path(cur, vx, vy, prediction_dt, steps=prediction_dt)
-
+        if tracker.has_enough_data and center is not None:
+            prev = tracker.current
+            vx, vy = predictor.compute_velocity(center, prev)
             speed = math.hypot(vx, vy)
+            predicted = predictor.predict(center, vx, vy, prediction_dt)
+            pred_path = predictor.predict_path(center, vx, vy, prediction_dt, steps=prediction_dt)
+
+        tracker.update(center, bbox, frame_count, velocity=(vx, vy) if center is not None else None, yolo_class=yolo_class)
+        
+        # Extrapolate if LOST
+        if center is None and tracker.state == "LOST" and tracker.has_enough_data:
+            last_pos = tracker.current
+            if len(tracker.velocity_history) > 0:
+                vx, vy = tracker.velocity_history[-1]
+                speed = math.hypot(vx, vy)
+                dt_lost = tracker.frames_since_seen
+                extrapolated_pos = (int(last_pos[0] + vx * dt_lost), int(last_pos[1] + vy * dt_lost))
+                predicted = predictor.predict(extrapolated_pos, vx, vy, prediction_dt)
+                pred_path = predictor.predict_path(extrapolated_pos, vx, vy, prediction_dt, steps=prediction_dt)
 
         # ══════════════════════════════════════════════════════════════════
         #  DRAWING
         # ══════════════════════════════════════════════════════════════════
 
-        # --- History trail ---
         trail = tracker.get_trail()
         if len(trail) > 1:
             draw_trail(display, trail)
 
-        # --- Prediction line / path ---
         if pred_path:
             draw_prediction_line(display, pred_path)
 
-        # --- Bounding box ---
-        if bbox is not None:
+        state_color = CLR_STATE_DET
+        if tracker.state == "TRACKED": state_color = CLR_STATE_TRK
+        elif tracker.state == "LOST": state_color = CLR_STATE_LST
+        
+        if bbox is not None and center is not None:
             x, y, w, h = bbox
-            cv2.rectangle(display, (x, y), (x + w, y + h), CLR_BBOX, 2, cv2.LINE_AA)
-            cv2.putText(display, "DETECTED", (x, y - 8),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, CLR_BBOX, 1, cv2.LINE_AA)
+            cv2.rectangle(display, (x, y), (x + w, y + h), state_color, 2, cv2.LINE_AA)
+            label = f"ID:{tracker.object_id} | {tracker.classification} | {tracker.state}"
+            cv2.putText(display, label, (x, y - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, state_color, 1, cv2.LINE_AA)
 
-        # --- Current detected position (center point) ---
         if center is not None:
-            cv2.circle(display, center, 7, CLR_DETECTED, -1, cv2.LINE_AA)
-            cv2.circle(display, center, 11, CLR_DETECTED, 2, cv2.LINE_AA)
+            cv2.circle(display, center, 7, state_color, -1, cv2.LINE_AA)
+            cv2.circle(display, center, 11, state_color, 2, cv2.LINE_AA)
 
-        # --- Velocity arrow ---
+        if center is None and tracker.state == "LOST" and tracker.has_enough_data:
+            last_pos = tracker.current
+            vx, vy = tracker.velocity_history[-1] if len(tracker.velocity_history) > 0 else (0, 0)
+            dt_lost = tracker.frames_since_seen
+            extrapolated_pos = (int(last_pos[0] + vx * dt_lost), int(last_pos[1] + vy * dt_lost))
+            cv2.circle(display, extrapolated_pos, 7, state_color, 1, cv2.LINE_AA)
+            cv2.putText(display, f"ID:{tracker.object_id} LOST", (extrapolated_pos[0]-20, extrapolated_pos[1]-15),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, state_color, 1, cv2.LINE_AA)
+
         if center is not None and speed > 0.5:
             draw_velocity_arrow(display, center, vx, vy, scale=6.0)
 
-        # --- Predicted future position ---
         if predicted is not None:
             draw_crosshair(display, predicted, size=22)
             cv2.circle(display, predicted, 5, CLR_PREDICTED, -1, cv2.LINE_AA)
-
-            # Ring around final predicted point
             cv2.circle(display, predicted, 16, CLR_FUTURE_RING, 2, cv2.LINE_AA)
             cv2.putText(display, f"PREDICTED ({predicted[0]}, {predicted[1]})",
                         (predicted[0] + 20, predicted[1] - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.50, CLR_FUTURE_RING, 2, cv2.LINE_AA)
 
-        # --- Connection line: current → predicted ---
         if center is not None and predicted is not None:
             cv2.line(display, center, predicted, CLR_ACCENT, 1, cv2.LINE_AA)
             dist = math.hypot(predicted[0] - center[0], predicted[1] - center[1])
@@ -419,17 +512,17 @@ def main():
             cv2.putText(display, f"{dist:.0f}px", (mid[0] + 5, mid[1] - 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.40, CLR_ACCENT, 1, cv2.LINE_AA)
 
-        # --- FPS ---
         dt_frame = time.perf_counter() - t0
         fps_now = 1.0 / max(dt_frame, 1e-9)
         fps_avg = 0.9 * fps_avg + 0.1 * fps_now
 
-        # --- Info panel ---
         direction = math.degrees(math.atan2(-vy, vx)) % 360 if speed > 0.3 else 0
         info = [
-            "AATIS Drone Target Predictor",
+            "AATIS Tracking & Identification",
             f"FPS: {fps_avg:.1f}  |  Frame: {frame_count}",
-            f"Status: {'TRACKING' if center else 'SEARCHING...'}",
+            f"State: {tracker.state}",
+            f"Class: {tracker.classification} " + (f"(YOLO: {tracker.yolo_class})" if tracker.yolo_class else ""),
+            f"Object ID: {tracker.object_id}",
             f"Smoothing: {'ON' if predictor.smoothing_enabled else 'OFF'}",
             f"Prediction dt: {prediction_dt} frames",
         ]
@@ -443,7 +536,6 @@ def main():
 
         draw_info_panel(display, info)
 
-        # --- Formula overlay (bottom-right) ---
         if center and predicted and speed > 0.3:
             formula_lines = [
                 f"vx = {tracker.current[0]} - {tracker.previous[0]} => {vx:.1f}",
@@ -454,50 +546,37 @@ def main():
             draw_info_panel(display, ["Math:"] + formula_lines,
                             origin=(frame_w - 380, frame_h - 170))
 
-        # ══════════════════════════════════════════════════════════════════
-        #  DISPLAY
-        # ══════════════════════════════════════════════════════════════════
         cv2.imshow("AATIS - Drone Target Prediction", display)
 
-        # Small mask window
         mask_color = cv2.cvtColor(fg_mask, cv2.COLOR_GRAY2BGR)
         mask_small = cv2.resize(mask_color, (frame_w // 3, frame_h // 3))
         cv2.imshow("Foreground Mask", mask_small)
 
-        # ══════════════════════════════════════════════════════════════════
-        #  KEY HANDLING
-        # ══════════════════════════════════════════════════════════════════
         key = cv2.waitKey(1) & 0xFF
 
         if key == ord('q'):
             break
-
         elif key == ord('r'):
             detector.reset()
             tracker.reset()
             predictor.reset()
             print("[INFO] Tracker reset.")
-
         elif key == ord('s'):
             os.makedirs(screenshot_dir, exist_ok=True)
             fname = os.path.join(screenshot_dir, f"frame_{frame_count}.png")
             cv2.imwrite(fname, display)
             print(f"[INFO] Screenshot saved: {fname}")
-
         elif key in (ord('+'), ord('=')):
             prediction_dt = min(prediction_dt + 2, 60)
             print(f"[INFO] Prediction dt = {prediction_dt} frames")
-
         elif key in (ord('-'), ord('_')):
             prediction_dt = max(prediction_dt - 2, 1)
             print(f"[INFO] Prediction dt = {prediction_dt} frames")
-
         elif key == ord('f'):
             predictor.smoothing_enabled = not predictor.smoothing_enabled
             status = "ON" if predictor.smoothing_enabled else "OFF"
             print(f"[INFO] Smoothing: {status}")
 
-    cap.release()
     cv2.destroyAllWindows()
     print("[INFO] Application closed.")
 
